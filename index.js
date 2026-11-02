@@ -1,0 +1,28 @@
+const {onCall,HttpsError}=require('firebase-functions/v2/https');
+const {onRequest}=require('firebase-functions/v2/https');
+const {defineSecret}=require('firebase-functions/params');
+const admin=require('firebase-admin');
+admin.initializeApp();
+const db=admin.firestore();
+const PAYSTACK_SECRET=defineSecret('PAYSTACK_SECRET_KEY');
+const REGION='africa-south1';
+exports.initializePaystackPayment=onCall({region:REGION,secrets:[PAYSTACK_SECRET],cors:true},async(req)=>{
+ if(!req.auth)throw new HttpsError('unauthenticated','Please sign in first.');
+ const {items,customerName,customerEmail,customerPhone,orderType='takeaway',notes=''}=req.data||{};
+ if(!Array.isArray(items)||!items.length||items.length>30)throw new HttpsError('invalid-argument','Your basket is empty or invalid.');
+ if(!customerName||!customerEmail||!customerPhone)throw new HttpsError('invalid-argument','Complete all customer details.');
+ const ids=[...new Set(items.map(x=>String(x.menuItemId||'')))];
+ const docs=await Promise.all(ids.map(id=>db.collection('menu').doc(id).get()));
+ const byId=new Map(docs.filter(d=>d.exists).map(d=>[d.id,d.data()]));
+ let clean=[],subtotal=0;
+ for(const item of items){const m=byId.get(String(item.menuItemId));const qty=Number(item.quantity);if(!m||m.available!==true||!Number.isInteger(qty)||qty<1||qty>30)throw new HttpsError('failed-precondition','A selected menu item is unavailable. Refresh your basket.');const price=Number(m.price);if(!Number.isFinite(price)||price<=0)throw new HttpsError('internal','Invalid menu price.');subtotal+=price*qty;clean.push({menuItemId:String(item.menuItemId),name:m.name,price,quantity:qty});}
+ const setting=await db.doc('settings/public').get();const fee=Number(setting.exists?setting.data().serviceFee||0:0);const total=subtotal+fee;if(!Number.isSafeInteger(total)||total<1||total>1000000)throw new HttpsError('invalid-argument','Order total is outside the permitted range.');
+ const orderRef=db.collection('orders').doc();await orderRef.set({userId:req.auth.uid,customerName:String(customerName).slice(0,80),customerEmail:String(customerEmail).slice(0,160),customerPhone:String(customerPhone).slice(0,30),orderType:orderType==='dine-in'?'dine-in':'takeaway',notes:String(notes).slice(0,300),items:clean,subtotal,serviceFee:fee,total,currency:'KES',paymentMethod:'paystack',paymentStatus:'pending',status:'pending',createdAt:admin.firestore.FieldValue.serverTimestamp()});
+ const secret=PAYSTACK_SECRET.value();if(!secret||!secret.startsWith('sk_live_')){await orderRef.update({paymentStatus:'configuration-error'});throw new HttpsError('failed-precondition','Live Paystack is not configured. Administrator must add the live secret key.');}
+ const base=req.rawRequest?.headers?.origin||'https://example.com';
+ const callback=`${base.replace(/\/$/,'')}/payment-callback.html?order=${orderRef.id}`;
+ try{const response=await fetch('https://api.paystack.co/transaction/initialize',{method:'POST',headers:{Authorization:`Bearer ${secret}`,'Content-Type':'application/json'},body:JSON.stringify({email:String(customerEmail),amount:total*100,currency:'KES',reference:orderRef.id,callback_url:callback,metadata:{orderId:orderRef.id,userId:req.auth.uid,custom_fields:[{display_name:'Customer',variable_name:'customer_name',value:String(customerName)}]}})});const data=await response.json();if(!response.ok||!data.status)throw new Error(data.message||'Paystack initialization failed');await orderRef.update({paymentReference:data.data.reference});return {authorizationUrl:data.data.authorization_url,orderId:orderRef.id,reference:data.data.reference};}
+ catch(e){await orderRef.update({paymentStatus:'initialization-failed'});throw new HttpsError('unavailable','Could not initialize payment. Please try again.');}
+});
+exports.verifyPaystackPayment=onCall({region:REGION,secrets:[PAYSTACK_SECRET]},async(req)=>{if(!req.auth)throw new HttpsError('unauthenticated','Sign in required.');const orderId=String(req.data?.orderId||'');const ref=String(req.data?.reference||'');const orderRef=db.collection('orders').doc(orderId);const snap=await orderRef.get();if(!snap.exists||snap.data().userId!==req.auth.uid)throw new HttpsError('not-found','Order not found.');if(snap.data().paymentStatus==='paid')return {paid:true};const response=await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`,{headers:{Authorization:`Bearer ${PAYSTACK_SECRET.value()}`}});const result=await response.json();if(!response.ok||!result.status||result.data.status!=='success'||result.data.reference!==snap.data().paymentReference||Number(result.data.amount)!==snap.data().total*100||result.data.currency!=='KES')throw new HttpsError('failed-precondition','Payment has not been verified as successful.');await orderRef.update({paymentStatus:'paid',paidAt:admin.firestore.FieldValue.serverTimestamp(),paystackTransactionId:String(result.data.id)});return {paid:true,orderId};});
+exports.paystackWebhook=onRequest({region:REGION,secrets:[PAYSTACK_SECRET]},async(req,res)=>{const crypto=require('crypto');const signature=req.headers['x-paystack-signature'];const expected=crypto.createHmac('sha512',PAYSTACK_SECRET.value()).update(req.rawBody || JSON.stringify(req.body)).digest('hex');if(!signature||signature!==expected){res.status(401).send('Invalid signature');return;}const event=req.body;if(event.event==='charge.success'){const ref=String(event.data?.reference||'');const snap=await db.collection('orders').doc(ref).get();if(snap.exists&&Number(event.data.amount)===snap.data().total*100&&event.data.currency==='KES'){await snap.ref.update({paymentStatus:'paid',paidAt:admin.firestore.FieldValue.serverTimestamp(),paystackTransactionId:String(event.data.id)});}}res.status(200).send('OK');});

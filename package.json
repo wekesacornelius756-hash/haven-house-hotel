@@ -1,0 +1,11 @@
+{
+  "name": "haven-house-hotel-billing",
+  "private": true,
+  "scripts": {
+    "serve": "firebase emulators:start --only hosting,auth,firestore,functions",
+    "deploy": "firebase deploy"
+  },
+  "devDependencies": {
+    "firebase-tools": "^13.29.0"
+  }
+}

@@ -1,0 +1,60 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function isAdmin() { return signedIn() && userDoc().data.role == 'admin'; }
+    function isStaff() { return signedIn() && userDoc().data.role in ['admin', 'waiter']; }
+
+    match /users/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'customer'
+        && request.resource.data.email == request.auth.token.email;
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.email == resource.data.email);
+      allow delete: if isAdmin();
+    }
+
+    match /menu/{itemId} {
+      allow read: if isAdmin() || resource.data.available == true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Customer orders are created only by trusted Cloud Functions after
+    // recalculating prices and initializing Paystack on the server.
+    match /orders/{orderId} {
+      allow create: if isStaff() && request.resource.data.createdBy == request.auth.uid;
+      allow read: if signedIn() && (resource.data.userId == request.auth.uid || isStaff());
+      allow update: if isAdmin() || (isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']));
+      allow delete: if isAdmin();
+    }
+
+    match /conversations/{conversationId} {
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow read: if signedIn() && (resource.data.userId == request.auth.uid || isStaff());
+      allow update: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'updatedAt']));
+      allow delete: if isAdmin();
+      match /messages/{messageId} {
+        function parent() { return get(/databases/$(database)/documents/conversations/$(conversationId)).data; }
+        allow read: if signedIn() && (parent().userId == request.auth.uid || isStaff());
+        allow create: if signedIn() && (parent().userId == request.auth.uid || isStaff())
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000;
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
